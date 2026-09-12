@@ -1842,7 +1842,10 @@ func (r *StreamTextResult) executeSingleTool(
 }
 
 func (r *StreamTextResult) emit(part TextStreamPart) {
-	r.fullStream <- part
+	select {
+	case r.fullStream <- part:
+	case <-r.done:
+	}
 }
 
 func (r *StreamTextResult) abort(ctx context.Context, cfg *streamConfig) {

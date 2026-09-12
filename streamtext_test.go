@@ -4619,3 +4619,97 @@ func TestIsDynamic_UnknownToolPreservesProviderValue(t *testing.T) {
 }
 
 func boolPtr(b bool) *bool { return &b }
+
+// TestStreamTextCancelUnblocksPublishers is the regression test for issue #165.
+//
+// Before the fix, r.emit() performed a bare channel send: any goroutine trying
+// to publish after the consumer stopped reading would block permanently even
+// after context cancellation because the fullStream buffer filled up.
+//
+// After the fix, r.emit selects on r.done so cancelling the context unblocks
+// all in-flight publishers within one scheduling round.
+func TestStreamTextCancelUnblocksPublishers(t *testing.T) {
+	const numTools = 20
+
+	var startCount atomic.Int32
+	allStarted := make(chan struct{})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	// Build a model that emits numTools tool-call parts then closes.
+	toolsCh := make(chan provider.StreamPart, numTools+2)
+	for i := range numTools {
+		toolsCh <- provider.StreamPart{
+			Type:       provider.PartToolCall,
+			ToolCallID: fmt.Sprintf("tc%d", i),
+			ToolName:   "slow",
+			Input:      `{}`,
+		}
+	}
+	toolsCh <- provider.StreamPart{
+		Type:         provider.PartFinish,
+		FinishReason: &provider.FinishReason{Unified: provider.FinishReasonToolCalls},
+		Usage: &provider.Usage{
+			InputTokens:  provider.InputTokenUsage{Total: intPtr(1)},
+			OutputTokens: provider.OutputTokenUsage{Total: intPtr(1)},
+		},
+	}
+	close(toolsCh)
+
+	model := &mockModel{
+		streamFunc: func(_ context.Context, _ provider.CallOptions) (*provider.StreamResult, error) {
+			return &provider.StreamResult{Stream: toolsCh}, nil
+		},
+	}
+
+	result := StreamText(ctx, model,
+		WithModelMessages(provider.UserText("hi")),
+		WithTools(ToolSet{
+			"slow": Tool{
+				Execute: func(toolCtx context.Context, _ json.RawMessage, _ ToolExecutionOptions) (json.RawMessage, error) {
+					n := startCount.Add(1)
+					if int(n) == numTools {
+						close(allStarted)
+					}
+					// Block until the context is cancelled — simulates a slow
+					// tool that respects its own context.
+					<-toolCtx.Done()
+					return json.RawMessage(`{}`), nil
+				},
+			},
+		}),
+	)
+
+	// Read from FullStream only until we see StreamStartStep, then abandon —
+	// simulates a client disconnecting mid-stream.
+	for part := range result.FullStream() {
+		if _, ok := part.(StreamStartStep); ok {
+			break
+		}
+	}
+
+	// Wait until all tool goroutines are executing so the fullStream buffer is
+	// saturated and emit() would block without the fix.
+	select {
+	case <-allStarted:
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for all tool goroutines to start")
+	}
+
+	// Cancel — must unblock all in-flight emit() calls promptly.
+	cancel()
+
+	done := make(chan struct{})
+	go func() {
+		result.Wait()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		// Pass: goroutines were released.
+	case <-time.After(3 * time.Second):
+		t.Fatal("Wait() did not return after context cancellation — goroutines are blocked on emit()")
+	}
+}
